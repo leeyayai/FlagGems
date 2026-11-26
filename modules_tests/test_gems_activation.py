@@ -45,3 +45,18 @@ def test_gems_silu_and_mul(shape, dtype):
 
     else:
         pytest.skip("Skipping vLLM SiluAndMul comparison: vLLM not installed")
+
+
+@pytest.mark.parametrize("shape", [(4, 128), (1, 64)])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_gems_silu_and_mul_packed(shape, dtype):
+    init_seed(42)
+
+    x = torch.randn(*shape, dtype=dtype, device=device)
+    target = GemsSiluAndMul()
+
+    out_test = target(x)
+    half = shape[-1] // 2
+    ref = torch.nn.functional.silu(x[..., :half]) * x[..., half:]
+
+    assert_close(out_test, ref, dtype)

@@ -47,6 +47,62 @@ def test_silu_and_mul(shape, dtype):
     utils.gems_assert_close(res_inp2_grad, ref_inp2_grad, dtype)
 
 
+@pytest.mark.silu_and_mul
+@pytest.mark.parametrize("shape", [(64, 6144), (17, 4096)])
+@pytest.mark.parametrize("dtype", utils.FLOAT_DTYPES)
+def test_silu_and_mul_infer(shape, dtype):
+    inp1 = torch.randn(shape, dtype=dtype, device=flag_gems.device)
+    inp2 = torch.randn(shape, dtype=dtype, device=flag_gems.device)
+
+    with torch.no_grad():
+        res = flag_gems.silu_and_mul(inp1, inp2)
+
+    ref_inp1 = utils.to_reference(inp1)
+    ref_inp2 = utils.to_reference(inp2)
+    ref = torch.mul(torch.nn.functional.silu(ref_inp1), ref_inp2).to(dtype)
+
+    utils.gems_assert_close(res, ref, dtype)
+
+
+@pytest.mark.silu_and_mul
+@pytest.mark.parametrize(
+    "shape",
+    [
+        (64, 6144),
+        (17, 4096),
+        (1, 2048),
+        (2, 2048),
+        (3, 2),
+        (7, 2050),
+        (5, 12288),
+        (0, 2048),
+        (4, 0),
+    ],
+)
+@pytest.mark.parametrize("dtype", utils.FLOAT_DTYPES)
+@pytest.mark.parametrize("layout", ["contiguous", "offset", "strided"])
+def test_silu_and_mul_packed(shape, dtype, layout):
+    rows, packed_cols = shape
+    if layout == "offset":
+        storage = torch.randn(
+            rows * packed_cols + 1, dtype=dtype, device=flag_gems.device
+        )
+        inp = storage[1:].view(shape)
+    elif layout == "strided":
+        storage = torch.randn(
+            (rows, packed_cols * 2), dtype=dtype, device=flag_gems.device
+        )
+        inp = storage[:, ::2]
+    else:
+        inp = torch.randn(shape, dtype=dtype, device=flag_gems.device)
+    with torch.no_grad():
+        res = flag_gems.silu_and_mul_packed(inp)
+
+    cols = shape[-1] // 2
+    ref = torch.nn.functional.silu(inp[..., :cols]) * inp[..., cols:]
+    utils.gems_assert_close(res, ref, dtype)
+
+
 @pytest.mark.silu_and_mul_out
 @pytest.mark.parametrize("shape", utils.POINTWISE_SHAPES)
 @pytest.mark.parametrize("dtype", utils.FLOAT_DTYPES)

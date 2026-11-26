@@ -102,6 +102,25 @@ def test_rms_norm(shape, dtype):
     utils.gems_assert_close(res_weight_grad, ref_weight_grad, dtype, reduce_dim=N)
 
 
+@pytest.mark.rms_norm
+@pytest.mark.parametrize("shape", [(64, 2048), (17, 4096)])
+@pytest.mark.parametrize("dtype", FLOAT_DTYPES)
+def test_rms_norm_infer(shape, dtype):
+    inp = torch.randn(shape, dtype=dtype, device=flag_gems.device)
+    weight = torch.ones(shape[-1], dtype=dtype, device=flag_gems.device)
+
+    with torch.no_grad():
+        res = flag_gems.rms_norm_infer(inp, [shape[-1]], weight, eps=1e-5)
+
+    ref_inp = utils.to_reference(inp)
+    ref_weight = utils.to_reference(weight)
+    ref = ref_inp.to(torch.float32)
+    ref = ref * torch.rsqrt(ref.pow(2).mean(-1, keepdim=True) + 1e-5)
+    ref = (ref_weight * ref.to(ref_weight.dtype)).to(dtype)
+
+    utils.gems_assert_close(res, ref, dtype)
+
+
 @pytest.mark.rms_norm_w8a16_fp8
 @pytest.mark.parametrize(
     "shape",

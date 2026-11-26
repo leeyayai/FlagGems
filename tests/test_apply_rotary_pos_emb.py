@@ -93,7 +93,9 @@ def _get_rope_cos_sin(max_seq_len, dim, dtype, base=10000, device=flag_gems.devi
 )
 @pytest.mark.parametrize(
     "q_heads,k_heads",
-    [(8, 1)] if cfg.QUICK_MODE else [(8, 1), (6, 2), (1, 1), (8, 8)],
+    [(8, 1), (17, 3)]
+    if cfg.QUICK_MODE
+    else [(8, 1), (6, 2), (1, 1), (8, 8), (17, 3)],
 )
 @pytest.mark.parametrize(
     "head_dim", [8] if cfg.TO_CPU or cfg.QUICK_MODE else [64, 96, 128, 256]
@@ -101,6 +103,8 @@ def _get_rope_cos_sin(max_seq_len, dim, dtype, base=10000, device=flag_gems.devi
 @pytest.mark.parametrize("dtype", utils.FLOAT_DTYPES)
 @pytest.mark.parametrize("rotary_interleaved", [True, False])
 @pytest.mark.parametrize("has_pos_id", [True, False])
+@pytest.mark.parametrize("inplace", [True, False])
+@pytest.mark.parametrize("strided", [True, False])
 @pytest.mark.skipif(
     flag_gems.vendor_name == "tsingmicro", reason="Issue #4131: not working"
 )
@@ -113,6 +117,8 @@ def test_apply_rotary_pos_emb(
     dtype,
     has_pos_id,
     rotary_interleaved,
+    inplace,
+    strided,
 ):
     seq_len = torch.randint(1, max_seq_len, (1,)).item()
     q = torch.randn(
@@ -126,6 +132,25 @@ def test_apply_rotary_pos_emb(
         0, max_seq_len, (batch_size, seq_len), device=flag_gems.device
     )
     cos, sin = _get_rope_cos_sin(max_seq_len, head_dim, dtype, device=flag_gems.device)
+
+    if strided:
+        q_storage = torch.empty(
+            (*q.shape[:-1], head_dim * 2), dtype=dtype, device=q.device
+        )
+        k_storage = torch.empty(
+            (*k.shape[:-1], head_dim * 3), dtype=dtype, device=k.device
+        )
+        q_storage[..., ::2].copy_(q)
+        k_storage[..., ::3].copy_(k)
+        q = q_storage[..., ::2]
+        k = k_storage[..., ::3]
+        cos_sin = torch.cat((cos, sin), dim=-1)
+        cos, sin = cos_sin.chunk(2, dim=-1)
+        position_storage = torch.empty(
+            (batch_size, seq_len * 2), dtype=position_ids.dtype, device=q.device
+        )
+        position_storage[..., ::2].copy_(position_ids)
+        position_ids = position_storage[..., ::2]
 
     ref_q = utils.to_reference(q, True)
     ref_k = utils.to_reference(k, True)
@@ -148,7 +173,14 @@ def test_apply_rotary_pos_emb(
         sin=sin,
         position_ids=position_ids if has_pos_id else None,
         rotary_interleaved=rotary_interleaved,
+        inplace=inplace,
     )
 
     utils.gems_assert_close(q_embed_out, q_embed_ref, dtype)
     utils.gems_assert_close(k_embed_out, k_embed_ref, dtype)
+    if inplace:
+        assert q_embed_out.data_ptr() == q.data_ptr()
+        assert k_embed_out.data_ptr() == k.data_ptr()
+    else:
+        utils.gems_assert_close(q, ref_q, dtype)
+        utils.gems_assert_close(k, ref_k, dtype)

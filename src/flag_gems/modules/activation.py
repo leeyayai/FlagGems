@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import logging
+from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -25,6 +26,7 @@ has_c_extension = False  # Disable C extension for now, as we have not implement
 
 __all__ = [
     "gems_silu_and_mul",
+    "gems_silu_and_mul_packed",
     "GemsSiluAndMul",
 ]
 
@@ -38,14 +40,24 @@ def gems_silu_and_mul(
     return flag_gems.silu_and_mul(x, y)
 
 
+def gems_silu_and_mul_packed(x: torch.Tensor) -> torch.Tensor:
+    logger.debug("GEMS CUSTOM PACKED SILU_AND_MUL FORWARD")
+    return flag_gems.silu_and_mul_packed(x)
+
+
 class GemsSiluAndMul(nn.Module):
     """
     Fused Silu and Mul activation function.
-    The function computes torch.mul(torch.nn.functional.silu(x), y) in a fused way.
+    With one input, computes SiLU of its first half times its second half.
+    With two inputs, computes torch.mul(torch.nn.functional.silu(x), y).
     """
 
     def __init__(self):
         super().__init__()
 
-    def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, y: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        if y is None:
+            return gems_silu_and_mul_packed(x)
         return gems_silu_and_mul(x, y)

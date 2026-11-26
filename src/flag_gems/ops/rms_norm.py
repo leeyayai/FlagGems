@@ -20,6 +20,7 @@ import triton
 import triton.language as tl
 
 from flag_gems import runtime
+from flag_gems._probe import probe
 from flag_gems.runtime import torch_device_fn
 from flag_gems.utils import libentry
 from flag_gems.utils import triton_lang_extension as ext
@@ -30,6 +31,59 @@ logger = logging.getLogger(__name__)
 @triton.jit
 def prev_multiple_of(a, b):
     return tl.cdiv(a, b) * b - b
+
+
+@triton.jit(do_not_specialize=["eps"])
+def _fast_rms_norm_kernel(
+    out_ptr,
+    in_ptr,
+    w_ptr,
+    N: tl.constexpr,
+    eps,
+    BLOCK_SIZE: tl.constexpr,
+    EVEN_N: tl.constexpr,
+):
+    row = tl.program_id(0)
+    cols = tl.max_contiguous(
+        tl.multiple_of(tl.arange(0, BLOCK_SIZE), BLOCK_SIZE), BLOCK_SIZE
+    )
+    row_off = row * N + cols
+
+    if EVEN_N:
+        x = tl.load(in_ptr + row_off).to(tl.float32)
+        w = tl.load(w_ptr + cols)
+    else:
+        mask = cols < N
+        x = tl.load(in_ptr + row_off, mask=mask, other=0.0).to(tl.float32)
+        w = tl.load(w_ptr + cols, mask=mask, other=0.0)
+
+    rrms = tl.math.rsqrt(tl.sum(x * x, axis=0) / N + eps)
+    y = ((x * rrms).to(in_ptr.dtype.element_ty) * w).to(in_ptr.dtype.element_ty)
+
+    if EVEN_N:
+        tl.store(out_ptr + row_off, y)
+    else:
+        tl.store(out_ptr + row_off, y, mask=mask)
+
+
+@libentry()
+@triton.jit(do_not_specialize=["eps"])
+def _rms_norm_infer_kernel(
+    out_ptr,
+    in_ptr,
+    w_ptr,
+    N,
+    eps,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = ext.program_id(0)
+    cols = tl.arange(0, BLOCK_SIZE)
+    mask = cols < N
+    x = tl.load(in_ptr + pid * N + cols, mask, other=0.0).to(tl.float32)
+    w = tl.load(w_ptr + cols, mask, other=0.0)
+    rrms = 1 / tl.sqrt(tl.sum(x * x, axis=0) / N + eps)
+    x_normed = (x * rrms).to(in_ptr.dtype.element_ty)
+    tl.store(out_ptr + pid * N + cols, x_normed * w, mask)
 
 
 @libentry()
@@ -88,6 +142,7 @@ def rms_norm_loop_kernel(
     N,
     eps,
     TILE_N: tl.constexpr,
+    WRITE_INV_RMS: tl.constexpr = True,
 ):
     if tl.constexpr(in_ptr.dtype.element_ty == tl.float16) or tl.constexpr(
         in_ptr.dtype.element_ty == tl.bfloat16
@@ -117,7 +172,8 @@ def rms_norm_loop_kernel(
 
     var = tl.sum(acc) / N
     rrms = 1 / tl.sqrt(var + eps)
-    tl.store(INV_RMS + pid, rrms)
+    if WRITE_INV_RMS:
+        tl.store(INV_RMS + pid, rrms)
 
     # Pass 2: normalize in reverse order (better L2 cache reuse)
     prev_multiple = prev_multiple_of(N, TILE_N)
@@ -402,5 +458,50 @@ class RmsNorm(torch.autograd.Function):
         return dx, None, dw, None
 
 
+def rms_norm_infer(x, normalized_shape, weight, eps=1e-5):
+    dim = x.ndim - len(normalized_shape)
+    M = math.prod(x.shape[:dim])
+    N = math.prod(normalized_shape)
+
+    x = x.contiguous()
+    weight = weight.contiguous()
+    y = torch.empty_like(x)
+    if M == 0:
+        return y
+
+    probe(
+        "rms_norm",
+        f"x={tuple(x.shape)} N={N} M={M} dtype={x.dtype} "
+        f"branch={'fast' if N <= 4096 else 'loop'}",
+    )
+
+    if N <= 4096:
+        block_size = triton.next_power_of_2(N)
+        with torch_device_fn.device(x.device):
+            if runtime.device.vendor_name == "metax":
+                num_warps = 4 if M <= 64 or block_size < 1024 else 2
+                _fast_rms_norm_kernel[(M,)](
+                    y,
+                    x,
+                    weight,
+                    N,
+                    eps,
+                    block_size,
+                    N == block_size,
+                    num_warps=num_warps,
+                )
+            else:
+                _rms_norm_infer_kernel[M,](
+                    y, x, weight, N, eps, block_size
+                )
+        return y
+
+    with torch_device_fn.device(x.device):
+        rms_norm_loop_kernel[M,](y, None, x, weight, N, eps, WRITE_INV_RMS=False)
+    return y
+
+
 def rms_norm(x, normalized_shape, weight, eps=1e-5):
+    if not torch.is_grad_enabled():
+        return rms_norm_infer(x, normalized_shape, weight, eps)
     return RmsNorm.apply(x, normalized_shape, weight, eps)

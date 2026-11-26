@@ -159,3 +159,54 @@ def test_reshape_and_cache_flash(
 
         torch.testing.assert_close(key_cache.cpu(), cloned_key_cache.cpu())
         torch.testing.assert_close(value_cache.cpu(), cloned_value_cache.cpu())
+
+
+@pytest.mark.parametrize("rotary_interleaved", [False, True])
+@pytest.mark.parametrize("num_kv_heads", [1, 2, 3])
+@pytest.mark.parametrize("num_tokens,head_dim", [(5, 64), (511, 128), (512, 128)])
+def test_fused_rope_and_cache_flash(rotary_interleaved, num_kv_heads, num_tokens, head_dim):
+    q_heads, block_size = 7, 8
+    dtype = torch.bfloat16
+    q = torch.randn(num_tokens, q_heads, head_dim, device=device, dtype=dtype)
+    k = torch.randn(num_tokens, num_kv_heads, head_dim, device=device, dtype=dtype)
+    v = torch.randn_like(k)
+    original_q = q.clone()
+    original_k = k.clone()
+    original_v = v.clone()
+    cos_sin = torch.randn(num_tokens + 2, head_dim, device=device, dtype=dtype)
+    cos, sin = cos_sin.chunk(2, dim=-1)
+    positions = torch.arange(num_tokens, device=device, dtype=torch.long) + 2
+    slots = torch.arange(num_tokens, device=device, dtype=torch.long) * 3
+    slots[2] = -1
+    num_blocks = (num_tokens * 3 + block_size - 1) // block_size
+    key_cache = torch.zeros(num_blocks, block_size, num_kv_heads, head_dim, device=device, dtype=dtype)
+    value_cache = torch.zeros_like(key_cache)
+
+    if rotary_interleaved:
+        pair0, pair1 = original_q[..., ::2].float(), original_q[..., 1::2].float()
+        key0, key1 = original_k[..., ::2].float(), original_k[..., 1::2].float()
+        cos_full = cos.repeat_interleave(2, dim=-1)[positions, None, :]
+        sin_full = sin.repeat_interleave(2, dim=-1)[positions, None, :]
+        q_ref = original_q.float() * cos_full + torch.stack((-pair1, pair0), -1).flatten(-2) * sin_full
+        k_ref = original_k.float() * cos_full[:, :1] + torch.stack((-key1, key0), -1).flatten(-2) * sin_full[:, :1]
+    else:
+        cos_full = torch.cat((cos, cos), dim=-1)[positions, None, :]
+        sin_full = torch.cat((sin, sin), dim=-1)[positions, None, :]
+        q_rot = torch.cat((-original_q[..., head_dim // 2:], original_q[..., :head_dim // 2]), -1)
+        k_rot = torch.cat((-original_k[..., head_dim // 2:], original_k[..., :head_dim // 2]), -1)
+        q_ref = original_q.float() * cos_full + q_rot.float() * sin_full
+        k_ref = original_k.float() * cos_full[:, :1] + k_rot.float() * sin_full[:, :1]
+
+    flag_gems.fused_rope_and_cache_flash(
+        q, k, v, key_cache, value_cache, cos, sin, positions, slots,
+        rotary_interleaved=rotary_interleaved,
+    )
+    torch.testing.assert_close(q.float(), q_ref, atol=0.04, rtol=0.04)
+    torch.testing.assert_close(k, original_k, atol=0, rtol=0)
+    torch.testing.assert_close(v, original_v, atol=0, rtol=0)
+    for token, slot in enumerate(slots.tolist()):
+        if slot < 0:
+            continue
+        block, offset = divmod(slot, block_size)
+        torch.testing.assert_close(key_cache[block, offset].float(), k_ref[token].float(), atol=0.04, rtol=0.04)
+        torch.testing.assert_close(value_cache[block, offset], v[token])

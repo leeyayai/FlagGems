@@ -45,9 +45,13 @@ def test_fused_add_rms_norm(shape, dtype):
 
     def _torch_fused_add_rms_norm(x, residual, weight, eps):
         x = x + residual
-        variance = x.pow(2).mean(-1, keepdim=True)
-        hidden_states = x * torch.rsqrt(variance + eps)
-        return weight * hidden_states, x
+        upcast_x = x.to(torch.float32)
+        variance = upcast_x.pow(2).mean(-1, keepdim=True)
+        if N > 4096:
+            upcast_x = upcast_x.to(dtype).float()
+        hidden_states = upcast_x * torch.rsqrt(variance + eps)
+        hidden_states = hidden_states.to(dtype)
+        return (weight.to(dtype) * hidden_states).to(dtype), x.to(dtype)
 
     ref_out, ref_new_residual = _torch_fused_add_rms_norm(
         ref_inp,
